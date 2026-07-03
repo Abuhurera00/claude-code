@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anthropic-ai-sdk = "0.2.27"
 anyhow = "1.0.102"
-async-openai = "0.41.1"
+async-openai = { version = "0.41.1", features = ["chat-completion"] }
 dotenvy = "0.15.7"
 inquire = "0.9.4"
 serde = { version = "1.0.228", features = ["derive"] }

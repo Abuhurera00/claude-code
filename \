@@ -1,23 +1,23 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use async_openai::{
-    Client,
     config::OpenAIConfig,
     types::chat::{
-        ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
-        ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
-        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessage,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionTools,
-        CreateChatCompletionRequestArgs, FinishReason, FunctionObjectArgs,
+      ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
+      ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
+      ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessage,
+      ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionTools,
+      CreateChatCompletionRequestArgs, FinishReason, FunctionObjectArgs
     },
+    Client,
 };
+use anyhow::{Context, Result};
 use inquire::Text;
 use tokio::{process::Command, time::timeout};
 
 fn get_model() -> anyhow::Result<String> {
-    dotenvy::dotenv().ok();
-    std::env::var("MODEL").context("MODEL is not set")
+   dotenvy::dotenv().ok();
+   std::env::var("MODEL").context("MODEL is not set")
 }
 
 const SYSTEM: &str = r#"You are a coding agent.
@@ -62,35 +62,38 @@ async fn main() -> anyhow::Result<()> {
             continue;
         };
 
+
         println!("--- Final response:\n{}", extract_text(final_content));
-    }
+    };
 
     Ok(())
 }
 
 fn get_tools() -> Result<Vec<ChatCompletionTools>> {
-    Ok(vec![ChatCompletionTools::Function(ChatCompletionTool {
-        function: FunctionObjectArgs::default()
-            .name("bash")
-            .description("Run a shell command in the current workspace.")
-            .parameters(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
+    Ok(vec![ChatCompletionTools::Function(
+        ChatCompletionTool {
+            function: FunctionObjectArgs::default()
+                .name("bash")
+                .description("Run a shell command in the current workspace.")
+                .parameters(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                        },
                     },
-                },
-                "required": ["command"],
-            }))
-            .build()?,
-    })])
+                    "required": ["command"],
+                }))
+                    .build()?,
+        }
+    )])
 }
 
 struct LoopState {
-    client: Client<OpenAIConfig>,
-    pub context: Vec<ChatCompletionRequestMessage>,
-    turn_count: usize,
-    transition_reason: Option<String>,
+   client: Client<OpenAIConfig>,
+   pub context: Vec<ChatCompletionRequestMessage>,
+   turn_count: usize,
+   transition_reason: Option<String>,
 }
 
 impl LoopState {
@@ -130,7 +133,7 @@ pub async fn run_bash(command: &str) -> String {
 
     match timeout(Duration::from_secs(120), output_future).await {
         Ok(Ok(output)) => {
-            // trim the stdout and stderr
+           // trim the stdout and stderr
             let combined = [output.stdout, output.stderr].concat();
             let out_str = String::from_utf8_lossy(&combined);
             let trimmed = out_str.trim();
@@ -154,13 +157,13 @@ pub async fn run_bash(command: &str) -> String {
 }
 
 fn extract_text(message: &ChatCompletionRequestMessage) -> String {
-    match message {
-        ChatCompletionRequestMessage::Assistant(message) => match &message.content {
-            Some(ChatCompletionRequestAssistantMessageContent::Text(content)) => content.clone(),
-            _ => String::new(),
-        },
-        _ => String::new(),
-    }
+      match message {
+          ChatCompletionRequestMessage::Assistant(message) => match &message.content {
+              Some(ChatCompletionRequestAssistantMessageContent::Text(content)) => content.clone(),
+             _ => String::new()
+          }
+         _ => String::new()
+      }
 }
 
 async fn execute_tool_call(
@@ -171,11 +174,12 @@ async fn execute_tool_call(
 
     for block in content {
         if let ChatCompletionMessageToolCalls::Function(tool_call) = block
-            && tool_call.function.name == "bash"
+        && tool_call.function.name == "bash"
             && let Ok(input) =
-                serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+            serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
             && let Some(command) = input.get("command").and_then(|value| value.as_str())
         {
+
             has_tool_use = true;
 
             let output = run_bash(command).await;
@@ -188,6 +192,7 @@ async fn execute_tool_call(
                     content: output.into(),
                 },
             ));
+
         }
     }
 

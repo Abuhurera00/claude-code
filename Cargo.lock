@@ -162,6 +162,7 @@ dependencies = [
  "anthropic-ai-sdk",
  "anyhow",
  "async-openai",
+ "async-trait",
  "dotenvy",
  "inquire",
  "serde",

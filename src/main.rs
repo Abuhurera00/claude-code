@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, collections::HashSet};
 
 use anyhow::{Context, Result};
 use async_openai::{
@@ -8,12 +8,11 @@ use async_openai::{
         ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
         ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessage,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionTools,
-        CreateChatCompletionRequestArgs, FinishReason, FunctionObjectArgs,
+        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs, FinishReason,
     },
 };
+use claude_code::tool::{Tool, toolset};
 use inquire::Text;
-use tokio::{process::Command, time::timeout};
 
 fn get_model() -> anyhow::Result<String> {
     dotenvy::dotenv().ok();
@@ -37,14 +36,14 @@ async fn main() -> anyhow::Result<()> {
             .with_api_base(base_url),
     );
 
-    let mut state = LoopState::new(client.clone());
+    let tools = toolset();
+    let mut state = LoopState::new(client.clone(), tools);
 
     loop {
         let query = Text::new("--- How can I help you today?")
             .prompt()
             .context("An error occurred or user cancelled the input.")?;
 
-        // break our of the loop if the user enters exit()
         if query.trim() == "exit()" {
             break;
         }
@@ -68,87 +67,62 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn get_tools() -> Result<Vec<ChatCompletionTools>> {
-    Ok(vec![ChatCompletionTools::Function(ChatCompletionTool {
-        function: FunctionObjectArgs::default()
-            .name("bash")
-            .description("Run a shell command in the current workspace.")
-            .parameters(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                    },
-                },
-                "required": ["command"],
-            }))
-            .build()?,
-    })])
-}
-
 struct LoopState {
     client: Client<OpenAIConfig>,
     pub context: Vec<ChatCompletionRequestMessage>,
-    turn_count: usize,
-    transition_reason: Option<String>,
+    tools: HashMap<String, Box<dyn Tool>>,
 }
 
 impl LoopState {
-    fn new(client: Client<OpenAIConfig>) -> Self {
+    fn new(client: Client<OpenAIConfig>, tools: HashMap<String, Box<dyn Tool>>) -> Self {
         Self {
             client,
             context: Vec::new(),
-            turn_count: 1,
-            transition_reason: None,
+            tools,
         }
     }
-}
 
-pub async fn run_bash(command: &str) -> String {
-    // 1. block dangerous commands
-    let dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
+    async fn execute_tool_call(
+        &mut self,
+        content: &[ChatCompletionMessageToolCalls],
+    ) -> Vec<ChatCompletionRequestMessage> {
+        let mut result = Vec::new();
 
-    if dangerous.iter().any(|item| command.contains(item)) {
-        return "Error: Dangerous command blocked".to_string();
-    }
+        for block in content {
+            if let ChatCompletionMessageToolCalls::Function(tool_call) = block {
+                let output = match serde_json::from_str::<serde_json::Value>(
+                    &tool_call.function.arguments,
+                ) {
+                    Ok(input) => self.execute(&tool_call.function.name, &input).await,
+                    Err(error) => format!("Invalid tool arguments: {}", error),
+                };
 
-    // 2. run command
-    let child = match Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => return format!("Error: Failed to run command: {}", e),
-    };
-
-    // 3. read output
-    let output_future = child.wait_with_output();
-
-    match timeout(Duration::from_secs(120), output_future).await {
-        Ok(Ok(output)) => {
-            // trim the stdout and stderr
-            let combined = [output.stdout, output.stderr].concat();
-            let out_str = String::from_utf8_lossy(&combined);
-            let trimmed = out_str.trim();
-
-            if trimmed.is_empty() {
-                "(No output)".to_string()
-            } else {
-                // limit output to 50k chars
-                trimmed.chars().take(50000).collect()
+                result.push(ChatCompletionRequestMessage::Tool(
+                    ChatCompletionRequestToolMessage {
+                        tool_call_id: tool_call.id.clone(),
+                        content: output.into(),
+                    },
+                ));
             }
         }
-        Ok(Err(e)) => {
-            // handle timeout
-            format!("Error: Command timed out: {}", e)
-        }
-        Err(_e) => {
-            // handle kill_on_drop(true) timeout
-            "Error: Timeout (120s)".to_string()
+
+        result
+    }
+
+    async fn execute(&mut self, name: &str, input: &serde_json::Value) -> String {
+        let Some(tool) = self.tools.get_mut(name) else {
+            return format!("Unknown tool: {name}");
+        };
+
+        match tool.invoke(input).await {
+            Ok(output) => {
+                println!("Tool: {}\nInput: {}\nOutput:\n{}\n", name, input, output);
+                output
+            }
+            Err(error) => {
+                println!("Error invoking tool {}: {}", name, error);
+                format!("Error invoking tool {}: {}", name, error)
+            }
         }
     }
 }
@@ -163,39 +137,41 @@ fn extract_text(message: &ChatCompletionRequestMessage) -> String {
     }
 }
 
-async fn execute_tool_call(
-    content: &[ChatCompletionMessageToolCalls],
-) -> Option<Vec<ChatCompletionRequestMessage>> {
-    let mut result = Vec::new();
-    let mut has_tool_use = false;
+fn normalize_messages(
+    messages: &[ChatCompletionRequestMessage],
+) -> Vec<ChatCompletionRequestMessage> {
+    let mut existing_results = HashSet::new();
 
-    for block in content {
-        if let ChatCompletionMessageToolCalls::Function(tool_call) = block
-            && tool_call.function.name == "bash"
-            && let Ok(input) =
-                serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
-            && let Some(command) = input.get("command").and_then(|value| value.as_str())
-        {
-            has_tool_use = true;
-
-            let output = run_bash(command).await;
-
-            println!("Command{} output: {}", command, output);
-
-            result.push(ChatCompletionRequestMessage::Tool(
-                ChatCompletionRequestToolMessage {
-                    tool_call_id: tool_call.id.clone(),
-                    content: output.into(),
-                },
-            ));
+    for message in messages {
+        if let ChatCompletionRequestMessage::Tool(tool_message) = message {
+            existing_results.insert(tool_message.tool_call_id.clone());
         }
     }
 
-    if !has_tool_use {
-        return None;
+    let mut normalized = Vec::new();
+
+    for message in messages {
+        normalized.push(message.clone());
+
+        if let ChatCompletionRequestMessage::Assistant(assistant_message) = message
+            && let Some(tool_calls) = &assistant_message.tool_calls
+        {
+            for tool_call in tool_calls {
+                if let ChatCompletionMessageToolCalls::Function(function_call) = tool_call
+                    && !existing_results.contains(&function_call.id)
+                {
+                    normalized.push(ChatCompletionRequestMessage::Tool(
+                        ChatCompletionRequestToolMessage {
+                            tool_call_id: function_call.id.clone(),
+                            content: "(cancelled)".to_string().into(),
+                        },
+                    ));
+                }
+            }
+        }
     }
 
-    Some(result)
+    normalized
 }
 
 #[allow(deprecated)]
@@ -207,14 +183,21 @@ async fn run_one_turn(state: &mut LoopState) -> Result<bool> {
             .into(),
     ];
 
-    messages.extend(state.context.clone());
+    messages.extend(normalize_messages(&state.context));
 
     let request = CreateChatCompletionRequestArgs::default()
         .model(get_model()?)
         .messages(messages)
         .max_tokens(8000_u32)
-        .tools(get_tools()?)
+        .tools(
+            state
+                .tools
+                .values()
+                .map(|tool| tool.tool_spec())
+                .collect::<Vec<_>>(),
+        )
         .build()?;
+
     let response = state.client.chat().create(request).await?;
 
     let choice = response
@@ -225,12 +208,11 @@ async fn run_one_turn(state: &mut LoopState) -> Result<bool> {
     let stop_reason = choice.finish_reason;
     let response_message = choice.message.clone();
 
-    // Store the assistant's response in the conversation context.
     let mut assistant_message = ChatCompletionRequestAssistantMessageArgs::default();
 
     if let Some(content) = response_message.content.clone() {
         assistant_message.content(content);
-    };
+    }
 
     if let Some(tool_calls) = response_message.tool_calls.clone() {
         assistant_message.tool_calls(tool_calls);
@@ -241,23 +223,16 @@ async fn run_one_turn(state: &mut LoopState) -> Result<bool> {
     if let Some(stop_reason) = stop_reason
         && !matches!(stop_reason, FinishReason::ToolCalls)
     {
-        state.transition_reason = None;
         return Ok(false);
     }
 
     let Some(tool_calls) = response_message.tool_calls.as_deref() else {
-        state.transition_reason = None;
         return Ok(false);
     };
 
-    let Some(result) = execute_tool_call(tool_calls).await else {
-        state.transition_reason = None;
-        return Ok(false);
-    };
+    let tool_result = state.execute_tool_call(tool_calls).await;
 
-    state.context.extend(result);
-    state.turn_count += 1;
-    state.transition_reason = Some("tool_result".to_string());
+    state.context.extend(tool_result);
 
     Ok(true)
 }
